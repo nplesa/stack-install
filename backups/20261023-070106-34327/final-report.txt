@@ -1,0 +1,66 @@
+STACK UPDATE REPORT
+Date: 2026-10-23T07:02:07-04:00
+Result: SUCCESS
+OS: Debian GNU/Linux 13 (trixie)
+PHP selected: 8.5; package version: 8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a
+MariaDB selected: 1:12.3.3+maria~deb13
+Nginx selected: 1.30.6-1~trixie
+Selected PHP extensions: MySQL (mysqli, pdo_mysql) cURL mbstring XML (dom, simplexml, xmlreader, xmlwriter) ZIP GD Intl BCMath SOAP SQLite Readline
+Optional packages selected: none
+Optional packages skipped: none
+SQL backup: gzip verified: /developer/backups/20261023-070106-34327/mariadb-all.sql.gz
+Installation started: 1
+Backup: /developer/backups/20261023-070106-34327
+Log: /var/log/update-stack.log
+
+INSTALLED VERSIONS
+nginx: 1.30.6-1~trixie
+mariadb-server: 1:12.3.3+maria~deb13
+php8.5-cli: 8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a
+git: 1:2.47.3-0+deb13u1
+composer: 2.8.8-1+deb13u3
+nodejs: 20.19.2+dfsg-1+deb13u3
+npm: 9.2.0~ds1-3
+redis-server: 5:8.0.2-3+deb13u3
+php8.5-redis: 6.3.0-2+0~20260711.69+debian13~1.gbpd148c3
+
+SERVICES
+mariadb: active=active, enabled=enabled
+php8.5-fpm: active=active, enabled=enabled
+nginx: active=active, enabled=enabled
+redis-server: active=active, enabled=enabled
+
+ACTIONS
+ - Configuration and initial package inventory backed up.
+ - User approved installation.
+ - Database backup completed, compressed, and integrity-checked.
+ - APT installation completed.
+ - Service active and enabled: mariadb
+ - Service active and enabled: php8.5-fpm
+ - Service active and enabled: nginx
+ - Service active and enabled: redis-server
+ - Final validation completed.
+
+WARNINGS
+ - OPcache: php8.5-opcache is not available in a compatible version; cannot select.
+
+BACKUP FILES
+/developer/backups/20261023-070106-34327/mariadb-eol.json (7221 bytes)
+/developer/backups/20261023-070106-34327/etc_redis.tar.gz (37090 bytes)
+/developer/backups/20261023-070106-34327/etc_nginx.tar.gz (2609 bytes)
+/developer/backups/20261023-070106-34327/nginx-supported.txt (10 bytes)
+/developer/backups/20261023-070106-34327/mariadb-all.sql.gz.sha256 (126 bytes)
+/developer/backups/20261023-070106-34327/packages-before.tsv (41362 bytes)
+/developer/backups/20261023-070106-34327/mariadb-dump.stderr (0 bytes)
+/developer/backups/20261023-070106-34327/apt-simulation.txt (1525 bytes)
+/developer/backups/20261023-070106-34327/final-report.txt (1650 bytes)
+/developer/backups/20261023-070106-34327/packages-after.tsv (41362 bytes)
+/developer/backups/20261023-070106-34327/etc_php.tar.gz (57854 bytes)
+/developer/backups/20261023-070106-34327/nginx-eol.json (4619 bytes)
+/developer/backups/20261023-070106-34327/php-modules.txt (460 bytes)
+/developer/backups/20261023-070106-34327/php-supported.txt (16 bytes)
+/developer/backups/20261023-070106-34327/etc_apt.tar.gz (72195 bytes)
+/developer/backups/20261023-070106-34327/mariadb-supported.txt (26 bytes)
+/developer/backups/20261023-070106-34327/etc_mysql.tar.gz (4055 bytes)
+/developer/backups/20261023-070106-34327/mariadb-all.sql.gz (541892 bytes)
+/developer/backups/20261023-070106-34327/php-eol.json (2664 bytes)

@@ -1,0 +1,20 @@
+Reading package lists...
+Building dependency tree...
+Reading state information...
+nginx is already the newest version (1.30.6-1~trixie).
+mariadb-server is already the newest version (1:12.3.3+maria~deb13).
+php8.5-cli is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-common is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-fpm is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-mysql is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-curl is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-mbstring is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-xml is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-zip is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-gd is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-intl is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-bcmath is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-soap is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-sqlite3 is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+php8.5-readline is already the newest version (8.5.12-1+0~20261021.27+debian13~1.gbp1a3e8a).
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.

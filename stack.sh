@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a LC_ALL=C
+
+BACKUP_ROOT="${BACKUP_ROOT:-/developer/backups}"
+LOG="/var/log/update-stack.log"
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+BACKUP="$BACKUP_ROOT/$STAMP"
+REPORT="$BACKUP/final-report.txt"
+SIMULATION="$BACKUP/apt-simulation.txt"
+FINALIZED=0
+INSTALL_STARTED=0
+DB_BACKUP_STATUS="not performed"
+PHP_VERSION="" PHP_FULL_VERSION="" PHP_BASE="" MARIADB_VERSION="" NGINX_VERSION=""
+declare -a ACTIONS=() WARNINGS=() PACKAGES=() SERVICES=() PHP_PACKAGES=() PHP_SELECTED=()
+declare -a OPTIONAL_SELECTED=() OPTIONAL_SKIPPED=() VALIDATE_MODULES=() PHP_BASES=() VERSIONS=()
+declare -A SELECTED_EXTENSIONS=()
+
+record() { ACTIONS+=("$*"); echo "[OK] $*"; }
+warn() { WARNINGS+=("$*"); echo "[WARNING] $*" >&2; }
+die() { WARNINGS+=("$*"); echo "[ERROR] $*" >&2; exit 1; }
+installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || :)" == installed ]]; }
+version_installed() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || :; }
+apt_candidate() { apt-cache policy "$1" | awk '/^[[:space:]]*Candidate:/{print $2;exit}'; }
+apt_versions() { apt-cache madison "$1" | awk '{print $3}' | sort -Vu; }
+has_version() { apt_versions "$1" | grep -Fxq -- "$2"; }
+apt_available() { local v; v="$(apt_candidate "$1")"; [[ -n "$v" && "$v" != '(none)' ]]; }
+
+ask() {
+    local answer
+    while :; do
+        printf '\n%s [yes/no]: ' "$1" > /dev/tty
+        IFS= read -r answer < /dev/tty || die 'Unable to read terminal response.'
+        case "${answer,,}" in yes|y) return 0;; no|n) return 1;; *) echo 'Enter yes or no.' > /dev/tty;; esac
+    done
+}
+choose() {
+    local prompt="$1" answer i; shift
+    local -a choices=("$@")
+    ((${#choices[@]})) || die "No choices for $prompt"
+    printf '\n%s\n' "$prompt" > /dev/tty
+    for i in "${!choices[@]}"; do printf '%d) %s\n' "$((i+1))" "${choices[$i]}" > /dev/tty; done
+    while :; do
+        printf 'Choose number (0 = cancel): ' > /dev/tty
+        IFS= read -r answer < /dev/tty || die 'No terminal input.'
+        [[ "$answer" =~ ^[0-9]{1,4}$ ]] || { echo 'Enter a valid number.' > /dev/tty; continue; }
+        if ((10#$answer == 0)); then die 'Selection cancelled.'; fi
+        if ((10#$answer >= 1 && 10#$answer <= ${#choices[@]})); then REPLY="${choices[$((10#$answer-1))]}"; return; fi
+        echo 'Selection out of range.' > /dev/tty
+    done
+}
+report() {
+    local status="${1:-INCOMPLETE}" svc pkg
+    (( FINALIZED == 0 )) || return 0
+    FINALIZED=1
+    [[ -d "$BACKUP" ]] || return 0
+    {
+        echo 'STACK UPDATE REPORT'
+        echo "Date: $(date -Is)"
+        echo "Result: $status"
+        echo "OS: ${PRETTY_NAME:-unknown}"
+        echo "PHP selected: ${PHP_VERSION:-not selected}; package version: ${PHP_FULL_VERSION:-not selected}"
+        echo "MariaDB selected: ${MARIADB_VERSION:-not selected}"
+        echo "Nginx selected: ${NGINX_VERSION:-not selected}"
+        echo "Selected PHP extensions: ${PHP_SELECTED[*]:-none}"
+        echo "Optional packages selected: ${OPTIONAL_SELECTED[*]:-none}"
+        echo "Optional packages skipped: ${OPTIONAL_SKIPPED[*]:-none}"
+        echo "SQL backup: $DB_BACKUP_STATUS"
+        echo "Installation started: $INSTALL_STARTED"
+        echo "Backup: $BACKUP"
+        echo "Log: $LOG"
+        echo; echo 'INSTALLED VERSIONS'
+        for pkg in nginx mariadb-server "${PHP_BASE:-php}-cli" git composer nodejs npm redis-server "${PHP_BASE:-php}-redis"; do
+            echo "$pkg: $(version_installed "$pkg")"
+        done
+        echo; echo 'SERVICES'
+        for svc in "${SERVICES[@]}"; do
+            echo "$svc: active=$(systemctl is-active "$svc" 2>/dev/null || :), enabled=$(systemctl is-enabled "$svc" 2>/dev/null || :)"
+        done
+        echo; echo 'ACTIONS'; printf ' - %s\n' "${ACTIONS[@]:-none}"
+        echo; echo 'WARNINGS'; printf ' - %s\n' "${WARNINGS[@]:-none}"
+        echo; echo 'BACKUP FILES'
+        find "$BACKUP" -type f -printf '%p (%s bytes)\n' 2>/dev/null || :
+    } > "$REPORT" || :
+    cat "$REPORT"
+}
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    if (( rc != 0 )); then WARNINGS+=("Interrupted (exit status $rc)"); report 'FAILED / INCOMPLETE' || :
+    elif (( FINALIZED == 0 )); then report 'INCOMPLETE' || :; fi
+}
+
+# Avoid any changes to the server until basic environment is checked.
+(( EUID == 0 )) || { echo '[ERROR] Run as root.' >&2; exit 1; }
+[[ -r /etc/os-release ]] || { echo '[ERROR] No /etc/os-release.' >&2; exit 1; }
+. /etc/os-release
+[[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13 && "${VERSION_CODENAME:-}" == trixie ]] || {
+    echo '[ERROR] This script requires Debian 13 Trixie.' >&2; exit 1;
+}
+[[ -r /dev/tty && -w /dev/tty ]] || { echo '[ERROR] An interactive terminal is required.' >&2; exit 1; }
+for cmd in apt-get apt-cache dpkg-query dpkg systemctl tar gzip sha256sum flock awk sed grep sort find tee curl python3 date; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "[ERROR] Missing prerequisite: $cmd" >&2; exit 1; }
+done
+mkdir -p /run/lock
+exec 9>/run/lock/update-stack.lock
+flock -n 9 || { echo '[ERROR] Another stack.sh is running.' >&2; exit 1; }
+mkdir -p "$BACKUP"
+chmod 0700 "$BACKUP_ROOT" "$BACKUP"
+touch "$LOG"; chmod 0600 "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+trap on_exit EXIT
+
+echo '=== SYSTEM ==='
+echo "OS: $PRETTY_NAME"
+echo "Architecture: $(dpkg --print-architecture)"
+
+echo '=== CONFIGURATION BACKUP ==='
+for path in etc/nginx etc/php etc/mysql etc/redis etc/apt; do
+    if [[ -e "/$path" ]]; then
+        tar -czpf "$BACKUP/${path//\//_}.tar.gz" -C / "$path" || die "Failed to back up /$path"
+    fi
+done
+dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Status}\n' > "$BACKUP/packages-before.tsv"
+record 'Configuration and initial package inventory backed up.'
+
+echo '=== APT METADATA ==='
+apt-get update || die 'apt-get update failed.'
+
+echo '=== SUPPORT LIFECYCLE ==='
+# Only choose branches that are supported upstream and present in configured APT repositories.
+for product in php mariadb nginx; do
+    curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 --max-time 30 \
+        "https://endoflife.date/api/${product}.json" -o "$BACKUP/${product}-eol.json" || \
+        die "Cannot verify lifecycle data for $product"
+done
+python3 - "$BACKUP" <<'PY'
+import json
+import sys
+from datetime import date
+from pathlib import Path
+root = Path(sys.argv[1])
+today = date.today()
+for name in ('php','mariadb','nginx'):
+    data = json.loads((root/f'{name}-eol.json').read_text())
+    if not isinstance(data, list):
+        raise SystemExit(f'Invalid lifecycle data for {name}')
+    cycles = set()
+    for entry in data:
+        if not isinstance(entry,dict):
+            continue
+        cycle = str(entry.get('cycle',''))
+        eol = entry.get('eol')
+        if eol is False:
+            if cycle: cycles.add(cycle)
+        elif isinstance(eol, str):
+            try:
+                if date.fromisoformat(eol[:10]) >= today and cycle:
+                    cycles.add(cycle)
+            except ValueError:
+                pass
+    if not cycles:
+        raise SystemExit(f'No supported cycles reported for {name}')
+    (root/f'{name}-supported.txt').write_text('\n'.join(sorted(cycles))+'\n')
+    print(f'{name}: {", ".join(sorted(cycles))}')
+PY
+
+echo '=== SELECT PHP BRANCH ==='
+mapfile -t PHP_BASES < <(apt-cache pkgnames | grep -E '^php[0-9]+\.[0-9]+-cli$' | sed 's/-cli$//' | sort -Vu)
+declare -a PHP_CHOICES=()
+for base in "${PHP_BASES[@]}"; do
+    cycle="${base#php}"
+    grep -Fxq -- "$cycle" "$BACKUP/php-supported.txt" || continue
+    [[ -n "$(apt_candidate "$base-cli")" ]] || continue
+    if apt_available "$base-cli" && apt_available "$base-common" && apt_available "$base-fpm"; then
+        PHP_CHOICES+=("$cycle")
+    fi
+done
+((${#PHP_CHOICES[@]})) || die 'No supported PHP branch with CLI, common and FPM packages found.'
+choose 'PHP branch:' "${PHP_CHOICES[@]}"
+PHP_VERSION="$REPLY"; PHP_BASE="php$PHP_VERSION"
+
+# Core PHP packages must have exactly identical Debian package versions.
+mapfile -t VERSIONS < <(apt_versions "$PHP_BASE-cli")
+declare -a PHP_FULL_CHOICES=()
+for ver in "${VERSIONS[@]}"; do
+    upstream="${ver#*:}"; upstream="${upstream%%-*}"
+    [[ "$upstream" =~ ^${PHP_VERSION//./\.}\.[0-9]+$ ]] || continue
+    has_version "$PHP_BASE-common" "$ver" || continue
+    has_version "$PHP_BASE-fpm" "$ver" || continue
+    PHP_FULL_CHOICES+=("$ver")
+done
+((${#PHP_FULL_CHOICES[@]})) || die 'No exact matching PHP CLI/common/FPM versions.'
+choose 'Exact PHP package version:' "${PHP_FULL_CHOICES[@]}"
+PHP_FULL_VERSION="$REPLY"
+for suffix in cli common fpm; do PHP_PACKAGES+=("$PHP_BASE-$suffix=$PHP_FULL_VERSION"); done
+
+# Debian's separately packaged extensions usually use the same exact version as PHP core.
+# PECL packages (e.g. redis and imagick) have their own version numbering.
+declare -a EXT_DEFS=(
+    'mysql|MySQL (mysqli, pdo_mysql)|mysqli'
+    'curl|cURL|curl'
+    'mbstring|mbstring|mbstring'
+    'xml|XML (dom, simplexml, xmlreader, xmlwriter)|dom'
+    'zip|ZIP|zip'
+    'gd|GD|gd'
+    'intl|Intl|intl'
+    'bcmath|BCMath|bcmath'
+    'soap|SOAP|soap'
+    'opcache|OPcache|Zend OPcache'
+    'sqlite3|SQLite|pdo_sqlite'
+    'readline|Readline|readline'
+    'imagick|Imagick|imagick'
+)
+
+echo '=== SELECT PHP EXTENSIONS ==='
+for item in "${EXT_DEFS[@]}"; do
+    IFS='|' read -r suffix label module <<< "$item"
+    pkg="$PHP_BASE-$suffix"
+    # For PHP 8.x, readline may be compiled in / supplied by the core; confirm by runtime later.
+    available=no
+    package_spec=""
+    if [[ "$suffix" == imagick ]]; then
+        if apt_available "$pkg"; then available=yes; package_spec="$pkg"; fi
+    elif has_version "$pkg" "$PHP_FULL_VERSION"; then
+        available=yes; package_spec="$pkg=$PHP_FULL_VERSION"
+    fi
+    if [[ "$available" == no ]]; then
+        warn "$label: $pkg is not available in a compatible version; cannot select."
+        continue
+    fi
+    current="not installed"
+    if installed "$pkg"; then current="installed ($(version_installed "$pkg"))"; fi
+    echo "$label: $pkg [$current]"
+    if ask "Enable $label for PHP $PHP_VERSION?"; then
+        PHP_PACKAGES+=("$package_spec")
+        PHP_SELECTED+=("$label")
+        VALIDATE_MODULES+=("$module")
+        SELECTED_EXTENSIONS["$suffix"]=1
+    fi
+done
+
+# Confirm core PHP Redis availability and presence independently of the Redis server.
+echo '=== OPTIONAL COMPONENTS ==='
+offer_optional() {
+    local package="$1" name="$2" candidate
+    if installed "$package"; then
+        echo "[OK] $name already installed: $(version_installed "$package")"
+        return
+    fi
+    if ! apt_available "$package"; then warn "$name is not installed and unavailable in APT ($package)."; return; fi
+    candidate="$(apt_candidate "$package")"
+    echo "$name missing. Candidate: $candidate"
+    if ask "Install $name?"; then
+        PACKAGES+=("$package")
+        OPTIONAL_SELECTED+=("$name")
+    else OPTIONAL_SKIPPED+=("$name"); fi
+}
+if command -v git >/dev/null 2>&1; then
+    echo "[OK] Git already available: $(git --version)"
+else
+    offer_optional git 'Git'
+fi
+if command -v composer >/dev/null 2>&1; then
+    echo '[OK] Composer already available.'
+else
+    offer_optional composer 'Composer'
+fi
+# Require both node and npm. If just one is missing, do not reinstall the existing component explicitly.
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    echo "[OK] Node.js $(node --version) and npm $(npm --version) are available."
+else
+    if ! command -v node >/dev/null 2>&1; then offer_optional nodejs 'Node.js'; fi
+    if ! command -v npm >/dev/null 2>&1; then offer_optional npm 'npm'; fi
+fi
+offer_optional redis-server 'Redis Server'
+REDIS_PHP_PACKAGE="$PHP_BASE-redis"
+if installed "$REDIS_PHP_PACKAGE"; then
+    echo "[OK] PHP Redis package already installed: $(version_installed "$REDIS_PHP_PACKAGE")"
+elif apt_available "$REDIS_PHP_PACKAGE"; then
+    offer_optional "$REDIS_PHP_PACKAGE" "PHP Redis extension for PHP $PHP_VERSION"
+else
+    warn "PHP Redis package $REDIS_PHP_PACKAGE unavailable; not selecting another PHP version's Redis extension."
+fi
+
+echo '=== SELECT MARIADB AND NGINX ==='
+declare -a DB_CHOICES=() NGINX_CHOICES=()
+while IFS= read -r ver; do
+    normalized="${ver#*:}"; normalized="${normalized%%-*}"
+    [[ "$normalized" =~ ^([0-9]+\.[0-9]+)\. ]] || continue
+    grep -Fxq -- "${BASH_REMATCH[1]}" "$BACKUP/mariadb-supported.txt" && DB_CHOICES+=("$ver")
+done < <(apt_versions mariadb-server)
+((${#DB_CHOICES[@]})) || die 'No supported MariaDB version in configured APT sources.'
+choose 'MariaDB version:' "${DB_CHOICES[@]}"; MARIADB_VERSION="$REPLY"
+while IFS= read -r ver; do
+    normalized="${ver#*:}"
+    [[ "$normalized" =~ ^([0-9]+\.[0-9]+)\. ]] || continue
+    grep -Fxq -- "${BASH_REMATCH[1]}" "$BACKUP/nginx-supported.txt" && NGINX_CHOICES+=("$ver")
+done < <(apt_versions nginx)
+((${#NGINX_CHOICES[@]})) || die 'No supported Nginx version in configured APT sources.'
+choose 'Nginx version:' "${NGINX_CHOICES[@]}"; NGINX_VERSION="$REPLY"
+
+PACKAGES+=("nginx=$NGINX_VERSION" "mariadb-server=$MARIADB_VERSION" "${PHP_PACKAGES[@]}")
+
+echo '=== INSTALLATION PLAN ==='
+printf ' - %s\n' "${PACKAGES[@]}"
+echo "PHP extensions selected: ${PHP_SELECTED[*]:-none}"
+echo "Optional components selected: ${OPTIONAL_SELECTED[*]:-none}"
+echo '=== APT SIMULATION ==='
+apt-get -s install "${PACKAGES[@]}" > "$SIMULATION" 2>&1 || die 'APT simulation failed (check simulation file).'
+cat "$SIMULATION"
+if grep -Eq '^[[:space:]]*(Remv|Purg)[[:space:]]' "$SIMULATION"; then
+    die 'APT simulation proposes package removals.'
+fi
+if grep -Eiq 'downgrad|unmet dependencies|held broken packages' "$SIMULATION"; then
+    die 'APT simulation proposes downgrades or dependency problems.'
+fi
+
+echo '=== FINAL APPROVAL ==='
+echo 'APT metadata and configuration backups have been created; no packages installed yet.'
+ask 'Approve the package installation plan above?' || die 'Cancelled; no package installation performed.'
+record 'User approved installation.'
+
+echo '=== DATABASE BACKUP ==='
+if installed mariadb-server; then
+    command -v mariadb-dump >/dev/null 2>&1 || die 'mariadb-dump missing on existing installation.'
+    systemctl is-active --quiet mariadb || die 'Existing MariaDB is not active; backup is mandatory.'
+    # Separate stderr allows failures to be reported without leaking SQL into the log.
+    mariadb-dump --all-databases --single-transaction --routines --events --triggers \
+        --hex-blob > "$BACKUP/mariadb-all.sql" 2> "$BACKUP/mariadb-dump.stderr" || die 'MariaDB dump failed.'
+    [[ -s "$BACKUP/mariadb-all.sql" ]] || die 'MariaDB dump is empty.'
+    gzip -c "$BACKUP/mariadb-all.sql" > "$BACKUP/mariadb-all.sql.gz" || die 'SQL gzip failed.'
+    gzip -t "$BACKUP/mariadb-all.sql.gz" || die 'SQL gzip validation failed.'
+    sha256sum "$BACKUP/mariadb-all.sql.gz" > "$BACKUP/mariadb-all.sql.gz.sha256"
+    rm -f -- "$BACKUP/mariadb-all.sql"
+    DB_BACKUP_STATUS="gzip verified: $BACKUP/mariadb-all.sql.gz"
+    record 'Database backup completed, compressed, and integrity-checked.'
+else
+    DB_BACKUP_STATUS='MariaDB not previously installed'
+fi
+
+echo '=== PACKAGE INSTALLATION ==='
+INSTALL_STARTED=1
+apt-get install -y "${PACKAGES[@]}" || die 'apt-get install failed.'
+record 'APT installation completed.'
+
+echo '=== SERVICE STARTUP ==='
+SERVICES=(mariadb "$PHP_BASE-fpm" nginx)
+if installed redis-server; then SERVICES+=(redis-server); fi
+for svc in "${SERVICES[@]}"; do
+    systemctl enable --now "$svc" || die "Unable to start/enable $svc"
+    systemctl is-active --quiet "$svc" || die "Service not active: $svc"
+    systemctl is-enabled --quiet "$svc" || die "Service not enabled: $svc"
+    record "Service active and enabled: $svc"
+done
+
+echo '=== VALIDATION ==='
+nginx -t || die 'nginx -t failed.'
+mariadb-admin ping || die 'MariaDB failed health check.'
+"$PHP_BASE" -v || die 'Selected PHP CLI unavailable.'
+"$PHP_BASE" -m > "$BACKUP/php-modules.txt" || die 'Unable to query PHP modules.'
+for module in "${VALIDATE_MODULES[@]}"; do
+    grep -Fixq -- "$module" "$BACKUP/php-modules.txt" || die "Selected PHP module not loaded: $module"
+done
+if installed "$REDIS_PHP_PACKAGE"; then "$PHP_BASE" --ri redis || die 'Redis PHP extension not loaded.'; fi
+for spec in "${PHP_PACKAGES[@]}"; do
+    [[ "$spec" == *=* ]] || continue
+    pkg="${spec%%=*}"; version="${spec#*=}"
+    [[ "$(version_installed "$pkg")" == "$version" ]] || die "Unexpected PHP package version: $pkg"
+done
+if installed redis-server; then
+    if command -v redis-cli >/dev/null 2>&1; then
+        redis-cli ping || warn 'Redis running but redis-cli ping failed (authentication/custom port possible).'
+    else warn 'redis-cli not available; Redis network check omitted.'; fi
+fi
+for svc in "${SERVICES[@]}"; do systemctl is-active --quiet "$svc" || die "Service stopped: $svc"; done
+for cmd in git composer node npm; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        case "$cmd" in git) git --version;; composer) composer --version;; node) node --version;; npm) npm --version;; esac
+    else echo "[INFO] $cmd not installed."; fi
+done
+dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Status}\n' > "$BACKUP/packages-after.tsv"
+record 'Final validation completed.'
+report 'SUCCESS'
+echo "Backup: $BACKUP"
+echo "Log: $LOG"
+echo "Report: $REPORT"
