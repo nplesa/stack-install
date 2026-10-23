@@ -13,7 +13,7 @@ FINALIZED=0
 INSTALL_STARTED=0
 BOOTSTRAP_STATUS="not performed"
 DB_BACKUP_STATUS="not performed"
-PHP_VERSION="" PHP_FULL_VERSION="" PHP_BASE="" MARIADB_VERSION="" NGINX_VERSION=""
+PHP_VERSION="" PHP_FULL_VERSION="" PHP_BASE="" MARIADB_VERSION="" MARIADB_BRANCH="" NGINX_VERSION=""
 declare -a ACTIONS=() WARNINGS=() PACKAGES=() SERVICES=() PHP_PACKAGES=() PHP_SELECTED=()
 declare -a OPTIONAL_SELECTED=() OPTIONAL_SKIPPED=() VALIDATE_MODULES=() PHP_BASES=() VERSIONS=()
 declare -A SELECTED_EXTENSIONS=()
@@ -62,6 +62,7 @@ report() {
         echo "Result: $status"
         echo "OS: ${PRETTY_NAME:-unknown}"
         echo "PHP selected: ${PHP_VERSION:-not selected}; package version: ${PHP_FULL_VERSION:-not selected}"
+        echo "MariaDB branch: ${MARIADB_BRANCH:-not selected}"
         echo "MariaDB selected: ${MARIADB_VERSION:-not selected}"
         echo "Nginx selected: ${NGINX_VERSION:-not selected}"
         echo "Selected PHP extensions: ${PHP_SELECTED[*]:-none}"
@@ -118,7 +119,7 @@ flock -n 9 || { echo '[ERROR] Another stack.sh is running.' >&2; exit 1; }
 
 # STEP 1: Bootstrap from existing Debian repositories, prior to using curl/gpg/tar.
 # No third-party repository is used in this phase. Install only missing utilities.
-echo '=== STACK BUILD: 2026-10-23-sigpipe-fix-v5 ==='
+echo '=== STACK BUILD: 2026-10-23-mariadb-branch-menu-v6 ==='
 echo '=== STEP 1: BOOTSTRAP SCRIPT RUNTIME ==='
 declare -a BOOTSTRAP_PACKAGES=(
     ca-certificates curl gnupg gpgv
@@ -166,10 +167,6 @@ record 'Configuration and initial package inventory backed up.'
 echo '=== STEP 2: INSTALL REQUIRED REPOSITORIES ==='
 # Configure trusted upstream repositories before retrieving APT metadata and listing versions.
 # Never use apt-key or disable APT signature verification. Existing Debian sources stay intact.
-# MariaDB is intentionally pinned to the 11.8 LTS *repository branch*; selecting a
-# different MariaDB series requires adjusting MARIADB_REPO_BRANCH.
-MARIADB_REPO_BRANCH="${MARIADB_REPO_BRANCH:-11.8}"
-[[ "$MARIADB_REPO_BRANCH" == '11.8' ]] || die 'Only the verified MariaDB 11.8 repository branch is configured by this script.'
 mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
 
 # Warn and refuse to create duplicate/conflicting source definitions.
@@ -288,17 +285,46 @@ Signed-By: /etc/apt/keyrings/update-stack-sury.gpg
 EOF
 record 'PHP repository configured: packages.sury.org/php (Trixie).'
 
-# MariaDB Community Server: upstream LTS repository.
-check_duplicate_repo '/mariadb/repo/11.8/debian' /etc/apt/sources.list.d/update-stack-mariadb.sources
+# MariaDB: select the repository branch interactively BEFORE writing its APT source.
+# Only show branches whose official Debian 13 repository publishes signed APT metadata.
+echo '=== SELECT MARIADB REPOSITORY BRANCH ==='
+declare -a MARIADB_BRANCH_CHOICES=()
+for branch in 10.11 11.4 11.8 12.3 13.0; do
+    repo_url="https://deb.mariadb.org/${branch}/debian/dists/trixie/InRelease"
+    if curl --fail --silent --show-error --location --head --retry 1 --connect-timeout 8 --max-time 20 \
+        "$repo_url" >/dev/null 2>&1; then
+        case "$branch" in
+            13.0) MARIADB_BRANCH_CHOICES+=("${branch} (rolling)");;
+            *) MARIADB_BRANCH_CHOICES+=("${branch} (LTS)");;
+        esac
+    else
+        warn "MariaDB $branch: signed Trixie repository metadata not reachable; omitted from menu."
+    fi
+done
+((${#MARIADB_BRANCH_CHOICES[@]})) || die 'No official MariaDB Trixie repository branch is reachable.'
+choose 'MariaDB branch (select the series to install):' "${MARIADB_BRANCH_CHOICES[@]}"
+MARIADB_BRANCH="${REPLY%% *}"
+if [[ "$MARIADB_BRANCH" == 13.0 ]]; then
+    warn 'MariaDB 13.0 is a rolling release, not an LTS series.'
+    ask 'Continue with MariaDB 13.0 rolling?' || die 'MariaDB branch choice cancelled.'
+fi
+
+# Do not silently use another MariaDB branch already configured elsewhere.
+while IFS= read -r -d '' existing; do
+    [[ "$existing" == /etc/apt/sources.list.d/update-stack-mariadb.sources ]] && continue
+    if grep -Eq 'deb\.mariadb\.org/|/mariadb/repo/[0-9]+\.[0-9]+/' "$existing"; then
+        die "Existing MariaDB repository in $existing. Reconcile it before selecting another branch."
+    fi
+done < <(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -print0)
 fetch_mariadb_key /etc/apt/keyrings/update-stack-mariadb.gpg
 cat > /etc/apt/sources.list.d/update-stack-mariadb.sources <<EOF
 Types: deb
-URIs: https://deb.mariadb.org/11.8/debian
+URIs: https://deb.mariadb.org/${MARIADB_BRANCH}/debian
 Suites: trixie
 Components: main
 Signed-By: /etc/apt/keyrings/update-stack-mariadb.gpg
 EOF
-record 'MariaDB repository configured: 11.8 LTS (Trixie).'
+record "MariaDB repository configured: ${MARIADB_BRANCH} (Trixie)."
 
 # Nginx official stable repository (not mainline).
 check_duplicate_repo 'nginx.org/packages/debian' /etc/apt/sources.list.d/update-stack-nginx.sources
@@ -480,10 +506,12 @@ declare -a DB_CHOICES=() NGINX_CHOICES=()
 while IFS= read -r ver; do
     normalized="${ver#*:}"; normalized="${normalized%%-*}"
     [[ "$normalized" =~ ^([0-9]+\.[0-9]+)\. ]] || continue
-    grep -Fxq -- "${BASH_REMATCH[1]}" "$BACKUP/mariadb-supported.txt" && DB_CHOICES+=("$ver")
+    if [[ "${BASH_REMATCH[1]}" == "$MARIADB_BRANCH" ]] && grep -Fxq -- "${BASH_REMATCH[1]}" "$BACKUP/mariadb-supported.txt"; then
+        DB_CHOICES+=("$ver")
+    fi
 done < <(apt_versions mariadb-server)
 ((${#DB_CHOICES[@]})) || die 'No supported MariaDB version in configured APT sources.'
-choose 'MariaDB version:' "${DB_CHOICES[@]}"; MARIADB_VERSION="$REPLY"
+choose "MariaDB ${MARIADB_BRANCH} exact package version:" "${DB_CHOICES[@]}"; MARIADB_VERSION="$REPLY"
 while IFS= read -r ver; do
     normalized="${ver#*:}"
     [[ "$normalized" =~ ^([0-9]+\.[0-9]+)\. ]] || continue
