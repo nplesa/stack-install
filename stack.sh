@@ -1,4 +1,4 @@
-    fi
+fi
     if ! apt_available "$package"; then warn "$name is not installed and unavailable in APT ($package)."; return; fi
     candidate="$(apt_candidate "$package")"
     echo "$name missing. Candidate: $candidate"
