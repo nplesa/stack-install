@@ -118,7 +118,7 @@ flock -n 9 || { echo '[ERROR] Another stack.sh is running.' >&2; exit 1; }
 
 # STEP 1: Bootstrap from existing Debian repositories, prior to using curl/gpg/tar.
 # No third-party repository is used in this phase. Install only missing utilities.
-echo '=== STACK BUILD: 2026-10-23-mariadb-key-fallback-v3 ==='
+echo '=== STACK BUILD: 2026-10-23-nginx-multikey-v4 ==='
 echo '=== STEP 1: BOOTSTRAP SCRIPT RUNTIME ==='
 declare -a BOOTSTRAP_PACKAGES=(
     ca-certificates curl gnupg gpgv
@@ -200,6 +200,30 @@ fetch_key() {
     rm -f "$tmp"
 }
 
+# nginx.org publishes three official signing keys in a single armored file.
+# Require the EXACT set documented by nginx, not just one matching fingerprint.
+fetch_nginx_key() {
+    local url='https://nginx.org/keys/nginx_signing.key'
+    local destination="$1" tmp fingerprints expected
+    tmp="$(mktemp)" || die 'Cannot create temporary file for nginx signing keys.'
+    if ! curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 --max-time 45 "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        die "Could not download nginx signing keys: $url"
+    fi
+    fingerprints="$(gpg --batch --show-keys --with-colons "$tmp" 2>/dev/null | awk -F: '$1=="fpr" {print toupper($10)}' | LC_ALL=C sort -u)"
+    expected="$(printf '%s\n' \
+        '8540A6F18833A80E9C1653A42FD21310B49F6B46' \
+        '573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62' \
+        '9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3' | LC_ALL=C sort -u)"
+    if [[ "$fingerprints" != "$expected" ]]; then
+        rm -f "$tmp"
+        die "Unexpected nginx signing-key set; received: ${fingerprints:-none}; expected: $expected"
+    fi
+    install -m 0644 "$tmp" "$destination" || { rm -f "$tmp"; die "Cannot install nginx signing keys: $destination"; }
+    rm -f "$tmp"
+    record 'Nginx signing keys verified (all 3 official fingerprints).'
+}
+
 # MariaDB publishes both an armored key and an official keyring bundle.
 # Verify the documented Community Server key fingerprint, then export ONLY that
 # key into an isolated APT keyring. Never use a downloaded unverified key.
@@ -278,7 +302,7 @@ record 'MariaDB repository configured: 11.8 LTS (Trixie).'
 
 # Nginx official stable repository (not mainline).
 check_duplicate_repo 'nginx.org/packages/debian' /etc/apt/sources.list.d/update-stack-nginx.sources
-fetch_key 'https://nginx.org/keys/nginx_signing.key'     /etc/apt/keyrings/update-stack-nginx.asc     '8540A6F18833A80E9C1653A42FD21310B49F6B46'
+fetch_nginx_key /etc/apt/keyrings/update-stack-nginx.asc
 cat > /etc/apt/sources.list.d/update-stack-nginx.sources <<EOF
 Types: deb
 URIs: https://nginx.org/packages/debian
