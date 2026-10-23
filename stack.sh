@@ -118,6 +118,7 @@ flock -n 9 || { echo '[ERROR] Another stack.sh is running.' >&2; exit 1; }
 
 # STEP 1: Bootstrap from existing Debian repositories, prior to using curl/gpg/tar.
 # No third-party repository is used in this phase. Install only missing utilities.
+echo '=== STACK BUILD: 2026-10-23-mariadb-key-fallback-v3 ==='
 echo '=== STEP 1: BOOTSTRAP SCRIPT RUNTIME ==='
 declare -a BOOTSTRAP_PACKAGES=(
     ca-certificates curl gnupg gpgv
@@ -192,11 +193,57 @@ fetch_key() {
     fingerprint="$(gpg --batch --show-keys --with-colons "$tmp" 2>/dev/null | awk -F: '$1=="fpr" {print $10}')"
     if [[ " $fingerprint " != *" $expected_fingerprint "* ]]; then
         rm -f "$tmp"
-        die "Unexpected signing-key fingerprint for $url"
+        die "Unexpected signing-key fingerprint for $url; received: ${fingerprint:-none}; expected: $expected_fingerprint"
     fi
     # APT accepts ASCII-armored keys with .asc extensions.
     install -m 0644 "$tmp" "$destination" || { rm -f "$tmp"; die "Cannot install signing key: $destination"; }
     rm -f "$tmp"
+}
+
+# MariaDB publishes both an armored key and an official keyring bundle.
+# Verify the documented Community Server key fingerprint, then export ONLY that
+# key into an isolated APT keyring. Never use a downloaded unverified key.
+fetch_mariadb_key() {
+    local destination="$1" expected='177F4010FE56CA3336300305F1656F24C74CD1D8'
+    local url tmpdir keyfile fingerprints current
+    local -a urls=(
+        'https://mariadb.org/mariadb_release_signing_key.asc'
+        'https://supplychain.mariadb.com/mariadb-keyring-2019.gpg'
+    )
+    tmpdir="$(mktemp -d)" || die 'Could not create MariaDB temporary key directory.'
+    chmod 0700 "$tmpdir"
+    for url in "${urls[@]}"; do
+        keyfile="$tmpdir/downloaded-key"
+        if ! curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 --max-time 45 "$url" -o "$keyfile"; then
+            warn "Unable to download MariaDB signing key: $url"
+            continue
+        fi
+        fingerprints="$(gpg --batch --show-keys --with-colons "$keyfile" 2>/dev/null | awk -F: '$1=="fpr" {print toupper($10)}' || :)"
+        if ! printf '%s\n' "$fingerprints" | grep -Fxq "$expected"; then
+            warn "MariaDB key fingerprint mismatch from $url; received: ${fingerprints:-none}"
+            continue
+        fi
+        # Import into an isolated temporary keyring and export only the pinned key.
+        rm -f "$tmpdir/ring.gpg" "$tmpdir/ring.gpg~"
+        if ! gpg --batch --no-default-keyring --keyring "$tmpdir/ring.gpg" --import "$keyfile" >/dev/null 2>&1; then
+            warn "Could not parse MariaDB signing key from $url"
+            continue
+        fi
+        if ! gpg --batch --no-default-keyring --keyring "$tmpdir/ring.gpg" --export "$expected" > "$tmpdir/verified.gpg"; then
+            warn "Could not export verified MariaDB signing key from $url"
+            continue
+        fi
+        if [[ ! -s "$tmpdir/verified.gpg" ]]; then
+            warn "Exported MariaDB signing key is empty from $url"
+            continue
+        fi
+        install -m 0644 "$tmpdir/verified.gpg" "$destination" || die "Cannot install verified MariaDB keyring: $destination"
+        rm -rf -- "$tmpdir"
+        record "MariaDB signing key verified: $expected"
+        return 0
+    done
+    rm -rf -- "$tmpdir"
+    die 'No official MariaDB key source provided the expected Community Server fingerprint; repository was not enabled.'
 }
 
 # PHP: use Sury's signed Debian archive-keyring package without executing code from it.
@@ -219,13 +266,13 @@ record 'PHP repository configured: packages.sury.org/php (Trixie).'
 
 # MariaDB Community Server: upstream LTS repository.
 check_duplicate_repo '/mariadb/repo/11.8/debian' /etc/apt/sources.list.d/update-stack-mariadb.sources
-fetch_key 'https://mariadb.org/mariadb_release_signing_key.asc'     /etc/apt/keyrings/update-stack-mariadb.asc     '177F4010FE56CA3336300305F1656F24C74CD1D8'
+fetch_mariadb_key /etc/apt/keyrings/update-stack-mariadb.gpg
 cat > /etc/apt/sources.list.d/update-stack-mariadb.sources <<EOF
 Types: deb
 URIs: https://deb.mariadb.org/11.8/debian
 Suites: trixie
 Components: main
-Signed-By: /etc/apt/keyrings/update-stack-mariadb.asc
+Signed-By: /etc/apt/keyrings/update-stack-mariadb.gpg
 EOF
 record 'MariaDB repository configured: 11.8 LTS (Trixie).'
 
