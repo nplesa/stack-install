@@ -23,9 +23,9 @@ warn() { WARNINGS+=("$*"); echo "[WARNING] $*" >&2; }
 die() { WARNINGS+=("$*"); echo "[ERROR] $*" >&2; exit 1; }
 installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || :)" == installed ]]; }
 version_installed() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || :; }
-apt_candidate() { apt-cache policy "$1" | awk '/^[[:space:]]*Candidate:/{print $2;exit}'; }
+apt_candidate() { apt-cache policy "$1" | awk '/^[[:space:]]*Candidate:/ && !found {value=$2; found=1} END {if (found) print value}'; }
 apt_versions() { apt-cache madison "$1" | awk '{print $3}' | sort -Vu; }
-has_version() { apt_versions "$1" | grep -Fxq -- "$2"; }
+has_version() { apt_versions "$1" | awk -v wanted="$2" '$0 == wanted {found=1} END {exit !found}'; }
 apt_available() { local v; v="$(apt_candidate "$1")"; [[ -n "$v" && "$v" != '(none)' ]]; }
 
 ask() {
@@ -118,7 +118,7 @@ flock -n 9 || { echo '[ERROR] Another stack.sh is running.' >&2; exit 1; }
 
 # STEP 1: Bootstrap from existing Debian repositories, prior to using curl/gpg/tar.
 # No third-party repository is used in this phase. Install only missing utilities.
-echo '=== STACK BUILD: 2026-10-23-nginx-multikey-v4 ==='
+echo '=== STACK BUILD: 2026-10-23-sigpipe-fix-v5 ==='
 echo '=== STEP 1: BOOTSTRAP SCRIPT RUNTIME ==='
 declare -a BOOTSTRAP_PACKAGES=(
     ca-certificates curl gnupg gpgv
@@ -399,12 +399,12 @@ declare -a EXT_DEFS=(
     'intl|Intl|intl'
     'bcmath|BCMath|bcmath'
     'soap|SOAP|soap'
-    'opcache|OPcache|Zend OPcache'
     'sqlite3|SQLite|pdo_sqlite'
     'readline|Readline|readline'
     'imagick|Imagick|imagick'
 )
 
+# OPcache is typically provided by PHP core packages on this repository; no standalone phpX.Y-opcache package is required.
 echo '=== SELECT PHP EXTENSIONS ==='
 for item in "${EXT_DEFS[@]}"; do
     IFS='|' read -r suffix label module <<< "$item"
@@ -551,6 +551,12 @@ nginx -t || die 'nginx -t failed.'
 mariadb-admin ping || die 'MariaDB failed health check.'
 "$PHP_BASE" -v || die 'Selected PHP CLI unavailable.'
 "$PHP_BASE" -m > "$BACKUP/php-modules.txt" || die 'Unable to query PHP modules.'
+# OPcache may be bundled with the selected PHP core build rather than separately packaged.
+if "$PHP_BASE" -m | grep -Fixq 'Zend OPcache'; then
+    record 'PHP OPcache available in selected PHP build.'
+else
+    warn 'PHP OPcache module not detected; check distribution packaging and php.ini before production.'
+fi
 for module in "${VALIDATE_MODULES[@]}"; do
     grep -Fixq -- "$module" "$BACKUP/php-modules.txt" || die "Selected PHP module not loaded: $module"
 done
