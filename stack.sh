@@ -11,6 +11,7 @@ REPORT="$BACKUP/final-report.txt"
 SIMULATION="$BACKUP/apt-simulation.txt"
 FINALIZED=0
 INSTALL_STARTED=0
+BOOTSTRAP_STATUS="not performed"
 DB_BACKUP_STATUS="not performed"
 PHP_VERSION="" PHP_FULL_VERSION="" PHP_BASE="" MARIADB_VERSION="" NGINX_VERSION=""
 declare -a ACTIONS=() WARNINGS=() PACKAGES=() SERVICES=() PHP_PACKAGES=() PHP_SELECTED=()
@@ -67,6 +68,7 @@ report() {
         echo "Optional packages selected: ${OPTIONAL_SELECTED[*]:-none}"
         echo "Optional packages skipped: ${OPTIONAL_SKIPPED[*]:-none}"
         echo "SQL backup: $DB_BACKUP_STATUS"
+        echo "Bootstrap dependencies: $BOOTSTRAP_STATUS"
         echo "Installation started: $INSTALL_STARTED"
         echo "Backup: $BACKUP"
         echo "Log: $LOG"
@@ -100,12 +102,47 @@ on_exit() {
     echo '[ERROR] This script requires Debian 13 Trixie.' >&2; exit 1;
 }
 [[ -r /dev/tty && -w /dev/tty ]] || { echo '[ERROR] An interactive terminal is required.' >&2; exit 1; }
-for cmd in apt-get apt-cache dpkg-query dpkg systemctl tar gzip sha256sum flock awk sed grep sort find tee curl python3 date gpg dpkg-deb mktemp install; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "[ERROR] Missing prerequisite: $cmd" >&2; exit 1; }
+# Only the bootstrap primitives must already exist. Other tools are installed below.
+for cmd in apt-get dpkg-query dpkg mkdir date; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "[ERROR] Base Debian utility missing: $cmd" >&2; exit 1; }
 done
 mkdir -p /run/lock
+# flock is supplied by util-linux on Debian; if missing, safely stop rather than run unlocked.
+if ! command -v flock >/dev/null 2>&1; then
+    apt-get update || { echo '[ERROR] APT update failed before installing flock.' >&2; exit 1; }
+    apt-get install -y --no-install-recommends --no-remove util-linux || { echo '[ERROR] Cannot install flock.' >&2; exit 1; }
+    command -v flock >/dev/null 2>&1 || { echo '[ERROR] flock still missing.' >&2; exit 1; }
+fi
 exec 9>/run/lock/update-stack.lock
 flock -n 9 || { echo '[ERROR] Another stack.sh is running.' >&2; exit 1; }
+
+# STEP 1: Bootstrap from existing Debian repositories, prior to using curl/gpg/tar.
+# No third-party repository is used in this phase. Install only missing utilities.
+echo '=== STEP 1: BOOTSTRAP SCRIPT RUNTIME ==='
+declare -a BOOTSTRAP_PACKAGES=(
+    ca-certificates curl gnupg gpgv
+    tar gzip coreutils findutils grep sed gawk util-linux
+    python3 openssl dpkg apt
+)
+declare -a BOOTSTRAP_MISSING=()
+for package in "${BOOTSTRAP_PACKAGES[@]}"; do
+    if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || :)" != installed ]]; then
+        BOOTSTRAP_MISSING+=("$package")
+    fi
+done
+if ((${#BOOTSTRAP_MISSING[@]})); then
+    printf 'Installing missing runtime packages: %s\n' "${BOOTSTRAP_MISSING[*]}"
+    apt-get update || { echo '[ERROR] Cannot refresh base Debian APT metadata.' >&2; exit 1; }
+    apt-get install -y --no-install-recommends --no-remove "${BOOTSTRAP_MISSING[@]}" || {
+        echo '[ERROR] Unable to install bootstrap dependencies.' >&2; exit 1;
+    }
+else
+    echo '[OK] All bootstrap dependencies already installed.'
+fi
+for cmd in apt-get apt-cache dpkg-query dpkg systemctl tar gzip sha256sum flock awk sed grep sort find tee curl python3 date gpg dpkg-deb mktemp install; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "[ERROR] Runtime utility still unavailable: $cmd" >&2; exit 1; }
+done
+BOOTSTRAP_STATUS='installed and verified'
 mkdir -p "$BACKUP"
 chmod 0700 "$BACKUP_ROOT" "$BACKUP"
 touch "$LOG"; chmod 0600 "$LOG"
@@ -125,7 +162,7 @@ done
 dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Status}\n' > "$BACKUP/packages-before.tsv"
 record 'Configuration and initial package inventory backed up.'
 
-echo '=== CONFIGURE PACKAGE REPOSITORIES ==='
+echo '=== STEP 2: INSTALL REQUIRED REPOSITORIES ==='
 # Configure trusted upstream repositories before retrieving APT metadata and listing versions.
 # Never use apt-key or disable APT signature verification. Existing Debian sources stay intact.
 # MariaDB is intentionally pinned to the 11.8 LTS *repository branch*; selecting a
@@ -204,7 +241,7 @@ Signed-By: /etc/apt/keyrings/update-stack-nginx.asc
 EOF
 record 'Nginx stable repository configured: nginx.org (Trixie).'
 
-printf '\n=== APT METADATA (INCLUDING NEW REPOSITORIES) ===\n'
+printf '\n=== STEP 3: REFRESH APT FROM ALL REPOSITORIES ===\n'
 apt-get update || die 'apt-get update failed.'
 for pkg in php-cli mariadb-server nginx; do
     echo "APT policy for $pkg:"
