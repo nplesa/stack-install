@@ -100,7 +100,7 @@ on_exit() {
     echo '[ERROR] This script requires Debian 13 Trixie.' >&2; exit 1;
 }
 [[ -r /dev/tty && -w /dev/tty ]] || { echo '[ERROR] An interactive terminal is required.' >&2; exit 1; }
-for cmd in apt-get apt-cache dpkg-query dpkg systemctl tar gzip sha256sum flock awk sed grep sort find tee curl python3 date; do
+for cmd in apt-get apt-cache dpkg-query dpkg systemctl tar gzip sha256sum flock awk sed grep sort find tee curl python3 date gpg dpkg-deb mktemp install; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "[ERROR] Missing prerequisite: $cmd" >&2; exit 1; }
 done
 mkdir -p /run/lock
@@ -125,8 +125,91 @@ done
 dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Status}\n' > "$BACKUP/packages-before.tsv"
 record 'Configuration and initial package inventory backed up.'
 
-echo '=== APT METADATA ==='
+echo '=== CONFIGURE PACKAGE REPOSITORIES ==='
+# Configure trusted upstream repositories before retrieving APT metadata and listing versions.
+# Never use apt-key or disable APT signature verification. Existing Debian sources stay intact.
+# MariaDB is intentionally pinned to the 11.8 LTS *repository branch*; selecting a
+# different MariaDB series requires adjusting MARIADB_REPO_BRANCH.
+MARIADB_REPO_BRANCH="${MARIADB_REPO_BRANCH:-11.8}"
+[[ "$MARIADB_REPO_BRANCH" == '11.8' ]] || die 'Only the verified MariaDB 11.8 repository branch is configured by this script.'
+mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
+
+# Warn and refuse to create duplicate/conflicting source definitions.
+check_duplicate_repo() {
+    local uri="$1" destination="$2" existing
+    while IFS= read -r -d '' existing; do
+        [[ "$existing" == "$destination" ]] && continue
+        if grep -Fq -- "$uri" "$existing"; then
+            die "Repository $uri already configured in $existing. Reconcile existing APT sources manually before proceeding."
+        fi
+    done < <(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -print0)
+}
+
+fetch_key() {
+    local url="$1" destination="$2" expected_fingerprint="$3" tmp fingerprint
+    tmp="$(mktemp)"
+    if ! curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 --max-time 45         "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        die "Could not download signing key: $url"
+    fi
+    fingerprint="$(gpg --batch --show-keys --with-colons "$tmp" 2>/dev/null | awk -F: '$1=="fpr" {print $10}')"
+    if [[ " $fingerprint " != *" $expected_fingerprint "* ]]; then
+        rm -f "$tmp"
+        die "Unexpected signing-key fingerprint for $url"
+    fi
+    # APT accepts ASCII-armored keys with .asc extensions.
+    install -m 0644 "$tmp" "$destination" || { rm -f "$tmp"; die "Cannot install signing key: $destination"; }
+    rm -f "$tmp"
+}
+
+# PHP: use Sury's signed Debian archive-keyring package without executing code from it.
+check_duplicate_repo 'packages.sury.org/php' /etc/apt/sources.list.d/update-stack-php.sources
+SURY_PKG="$(mktemp --suffix=.deb)"
+curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 --max-time 45     'https://packages.sury.org/debsuryorg-archive-keyring.deb' -o "$SURY_PKG" || die 'Could not fetch Sury archive keyring package.'
+SURY_TMP="$(mktemp -d)"
+dpkg-deb -x "$SURY_PKG" "$SURY_TMP" || die 'Could not extract Sury keyring.'
+[[ -s "$SURY_TMP/usr/share/keyrings/debsuryorg-archive-keyring.gpg" ]] || die 'Sury keyring missing from archive.'
+install -m 0644 "$SURY_TMP/usr/share/keyrings/debsuryorg-archive-keyring.gpg"     /etc/apt/keyrings/update-stack-sury.gpg || die 'Could not install Sury keyring.'
+rm -rf -- "$SURY_TMP" "$SURY_PKG"
+cat > /etc/apt/sources.list.d/update-stack-php.sources <<EOF
+Types: deb
+URIs: https://packages.sury.org/php
+Suites: trixie
+Components: main
+Signed-By: /etc/apt/keyrings/update-stack-sury.gpg
+EOF
+record 'PHP repository configured: packages.sury.org/php (Trixie).'
+
+# MariaDB Community Server: upstream LTS repository.
+check_duplicate_repo '/mariadb/repo/11.8/debian' /etc/apt/sources.list.d/update-stack-mariadb.sources
+fetch_key 'https://mariadb.org/mariadb_release_signing_key.asc'     /etc/apt/keyrings/update-stack-mariadb.asc     '177F4010FE56CA3336300305F1656F24C74CD1D8'
+cat > /etc/apt/sources.list.d/update-stack-mariadb.sources <<EOF
+Types: deb
+URIs: https://deb.mariadb.org/11.8/debian
+Suites: trixie
+Components: main
+Signed-By: /etc/apt/keyrings/update-stack-mariadb.asc
+EOF
+record 'MariaDB repository configured: 11.8 LTS (Trixie).'
+
+# Nginx official stable repository (not mainline).
+check_duplicate_repo 'nginx.org/packages/debian' /etc/apt/sources.list.d/update-stack-nginx.sources
+fetch_key 'https://nginx.org/keys/nginx_signing.key'     /etc/apt/keyrings/update-stack-nginx.asc     '8540A6F18833A80E9C1653A42FD21310B49F6B46'
+cat > /etc/apt/sources.list.d/update-stack-nginx.sources <<EOF
+Types: deb
+URIs: https://nginx.org/packages/debian
+Suites: trixie
+Components: nginx
+Signed-By: /etc/apt/keyrings/update-stack-nginx.asc
+EOF
+record 'Nginx stable repository configured: nginx.org (Trixie).'
+
+printf '\n=== APT METADATA (INCLUDING NEW REPOSITORIES) ===\n'
 apt-get update || die 'apt-get update failed.'
+for pkg in php-cli mariadb-server nginx; do
+    echo "APT policy for $pkg:"
+    apt-cache policy "$pkg" || :
+done
 
 echo '=== SUPPORT LIFECYCLE ==='
 # Only choose branches that are supported upstream and present in configured APT repositories.
